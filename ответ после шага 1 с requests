@@ -1,0 +1,27 @@
+<html>
+<head>
+</head>
+<body>
+  <h1>ДЗ-1</h1>
+  <h1>Шаг #1 (из множества)</h1>
+Отправьте GET-запрос по адресу <code>/kwRjjJlJrkAu8N</code>
+<br />
+<br />
+В запросе должны быть выставлены cookie:
+<table border="1">
+  <tr><th>Ключ</th><th>Значение</th></tr>
+  <tr>
+    <td><code>F0bQku21V5CSNC</code></td>
+    <td><code>LyUzq5HWQErJ2um2PBOiRL6mccSChF13P</code></td>
+  </tr>
+  <tr>
+    <td><code>0c2mxBR1kciFsoY</code></td>
+    <td><code>xdHNSzzaKMcDmJRQbgG9AJnGyW6XBWOYVi94JBWzWqES2tV</code></td>
+  </tr>
+  <tr>
+    <td><code>O8j6mhnuzX9WmWK</code></td>
+    <td><code>4nZq6xOvhNKmAHyHQWxyPZe47Y9iRJPw5Mzm82fe</code></td>
+  </tr>
+</table>
+</body>
+</html>
