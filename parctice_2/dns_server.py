@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-# Корневые серверы (a.root-servers.net, b.root-servers.net, и т.д.)
 ROOT_SERVERS = [
     "198.41.0.4",
     "170.247.170.2",
@@ -18,7 +17,6 @@ ROOT_SERVERS = [
 
 CACHE_FILE = "dns_cache.pkl"
 
-# Коды типов записей
 TYPE_A = 1
 TYPE_NS = 2
 TYPE_CNAME = 5
@@ -43,8 +41,8 @@ class DNSRecord:
     rtype: int
     rclass: int
     ttl: int
-    rdata: bytes  # Сырые байты (для неизвестных записей) или пересобранные без сжатия
-    parsed_data: Optional[str] = None  # Человекочитаемое значение (IP или домен)
+    rdata: bytes
+    parsed_data: Optional[str] = None
 
 
 @dataclass
@@ -61,9 +59,6 @@ class DNSPacket:
         return self.flags & 0x000F
 
 
-# =====================================================================
-# 1. Ручной парсинг и сборка протокола DNS (20 баллов + 2 балла за типы)
-# =====================================================================
 
 def encode_domain_name(domain: str) -> bytes:
     """Кодирует доменное имя в формат DNS (3www7example3com0)."""
@@ -89,7 +84,6 @@ def decode_domain_name(data: bytes, offset: int) -> Tuple[str, int]:
         if length == 0:
             offset += 1
             break
-        # Проверка на указатель сжатия (первые два бита 11 -> 0xC0)
         if (length & 0xC0) == 0xC0:
             if not jumped:
                 original_offset = offset + 2
@@ -120,8 +114,6 @@ def parse_record(data: bytes, offset: int) -> Tuple[DNSRecord, int]:
     parsed_data = None
     uncompressed_rdata = raw_rdata
 
-    # Распаковываем сжатые домены внутри RDATA, чтобы при отправке клиенту
-    # или сохранении в кеш не ломались смещения (pointers)!
     if rtype == TYPE_A and rdlength == 4:
         parsed_data = socket.inet_ntop(socket.AF_INET, raw_rdata)
     elif rtype == TYPE_AAAA and rdlength == 16:
@@ -200,7 +192,6 @@ def build_packet(
 
     for section in (answers, authorities, additionals):
         for rec in section:
-            # Пропускаем псевдо-записи OPT (EDNS0, type 41), чтобы не усложнять ответ
             if rec.rtype == 41:
                 continue
             body.extend(encode_domain_name(rec.name))
@@ -212,14 +203,10 @@ def build_packet(
     return header + bytes(body)
 
 
-# =====================================================================
-# 2. Кеширование с учетом TTL и сохранением на диск (3 + 1 балл)
-# =====================================================================
 
 class DNSCache:
     def __init__(self, filename: str = CACHE_FILE):
         self.filename = filename
-        # Ключ: (qname, qtype) -> Значение: (rcode, List[(DNSRecord, expire_time)])
         self.store: Dict[Tuple[str, int], Tuple[int, List[Tuple[DNSRecord, float]]]] = {}
         self.load()
 
@@ -235,10 +222,8 @@ class DNSCache:
         for rec, expire_at in items:
             remaining_ttl = int(expire_at - now)
             if remaining_ttl <= 0:
-                # Если хотя бы одна запись устарела, сбрасываем ключ целиком
                 del self.store[key]
                 return None
-            # Возвращаем копию с актуальным остатком TTL
             valid_records.append(
                 DNSRecord(rec.name, rec.rtype, rec.rclass, remaining_ttl, rec.rdata, rec.parsed_data)
             )
@@ -253,7 +238,6 @@ class DNSCache:
                 ttl = rec.ttl if rec.ttl > 0 else default_ttl
                 items.append((rec, now + ttl))
         else:
-            # Для NXDOMAIN или пустого ответа сохраняем пустой список с коротким TTL
             items.append((DNSRecord(qname, qtype, CLASS_IN, default_ttl, b""), now + default_ttl))
 
         self.store[(qname.lower(), qtype)] = (rcode, items)
@@ -315,10 +299,6 @@ class DNSCache:
             print(f"[WARN] Не удалось загрузить кеш: {e}")
 
 
-# =====================================================================
-# 3. Специальное правило .multiply. (3 балла)
-# =====================================================================
-
 def check_multiply_rule(qname: str, qtype: int) -> Optional[List[DNSRecord]]:
     """
     Если в запросе встречается '.multiply.', возвращает IP 127.0.0.X,
@@ -341,21 +321,15 @@ def check_multiply_rule(qname: str, qtype: int) -> Optional[List[DNSRecord]]:
         for lbl in prefix_labels:
             product = (product * int(lbl)) % 256
     except ValueError:
-        # Если до multiply встретилось не число — правило не срабатывает (или можно вернуть 0)
         return None
 
     if qtype != TYPE_A:
-        # Если спросили AAAA или TXT для .multiply., возвращаем пустой NOERROR
         return []
 
     ip_str = f"127.0.0.{product}"
     rdata = socket.inet_pton(socket.AF_INET, ip_str)
     return [DNSRecord(clean_name, TYPE_A, CLASS_IN, 300, rdata, ip_str)]
 
-
-# =====================================================================
-# 4. Итеративный резолвер (База)
-# =====================================================================
 
 async def send_udp_query(server_ip: str, packet_bytes: bytes, timeout: float = 2.5) -> Optional[bytes]:
     """Отправляет одиночный UDP-запрос к авторитетному серверу."""
@@ -384,25 +358,21 @@ class IterativeResolver:
         qname = qname.strip(".").lower()
 
         if depth > 15:
-            return 2, []  # Защита от бесконечной рекурсии CNAME/NS
+            return 2, []
 
-        # 1. Проверяем спецправило .multiply.
         mult_res = check_multiply_rule(qname, qtype)
         if mult_res is not None:
             print(f"[MULTIPLY] {qname} -> {mult_res[0].parsed_data if mult_res else 'EMPTY'}")
             return 0, mult_res
 
-        # 2. Проверяем кеш
         cached = self.cache.get(qname, qtype)
         if cached is not None:
             rcode, records = cached
-            # Для пустых/NXDOMAIN записей у нас лежит заглушка с пустым rdata
             if records and len(records) == 1 and records[0].rdata == b"":
                 return rcode, []
             print(f"[CACHE HIT] {qname} (type={qtype})")
             return rcode, records
 
-        # 3. Итеративный опрос начиная с корневых серверов
         nameservers = list(ROOT_SERVERS)
         random.shuffle(nameservers)
 
@@ -411,7 +381,6 @@ class IterativeResolver:
                 break
 
             tx_id = random.randint(1, 65534)
-            # Флаг 0x0000: стандартный запрос БЕЗ рекурсии (RD=0)
             query_pkt = build_packet(tx_id, 0x0000, [DNSQuestion(qname, qtype, CLASS_IN)])
 
             response_pkt = None
@@ -427,25 +396,20 @@ class IterativeResolver:
             if not response_pkt:
                 break
 
-            # Если домен не существует (NXDOMAIN = 3)
             if response_pkt.rcode == 3:
                 self.cache.put(qname, qtype, 3, [])
                 return 3, []
 
-            # Попутно кешируем A-записи из Additional (Glue records)
             for add_rec in response_pkt.additionals:
                 if add_rec.rtype == TYPE_A and add_rec.parsed_data:
                     self.cache.put(add_rec.name, TYPE_A, 0, [add_rec])
 
-            # Случай А: Есть ответы в секции Answer
             if response_pkt.answers:
-                # Проверяем, есть ли прямой ответ нужного типа
                 direct_answers = [r for r in response_pkt.answers if r.rtype == qtype]
                 if direct_answers:
                     self.cache.put(qname, qtype, 0, response_pkt.answers)
                     return 0, response_pkt.answers
 
-                # Если мы искали A/AAAA/TXT, а нам вернули только CNAME — нужно доразрешить CNAME!
                 cnames = [r for r in response_pkt.answers if r.rtype == TYPE_CNAME]
                 if cnames and qtype != TYPE_CNAME:
                     cname_rec = cnames[0]
@@ -459,17 +423,14 @@ class IterativeResolver:
                 self.cache.put(qname, qtype, 0, response_pkt.answers)
                 return 0, response_pkt.answers
 
-            # Случай Б: В Authority вернулся SOA (значит домен есть, но записей такого типа нет -> NODATA)
             if any(r.rtype == TYPE_SOA for r in response_pkt.authorities):
                 self.cache.put(qname, qtype, 0, [])
                 return 0, []
 
-            # Случай В: Делегирование (список NS-серверов в секции Authority)
             ns_records = [r for r in response_pkt.authorities if r.rtype == TYPE_NS and r.parsed_data]
             if not ns_records:
                 return 0, []
 
-            # Ищем IP-адреса для этих NS в секции Additional (Glue records)
             glue_ips = {}
             for add_rec in response_pkt.additionals:
                 if add_rec.rtype == TYPE_A and add_rec.parsed_data:
@@ -481,7 +442,6 @@ class IterativeResolver:
                 if ns_domain in glue_ips:
                     next_nameservers.append(glue_ips[ns_domain])
 
-            # Если Glue records нет (например, NS в другой зоне), резолвим IP первого NS-сервера!
             if not next_nameservers:
                 for ns_rec in ns_records[:2]:
                     ns_domain = ns_rec.parsed_data.lower()
@@ -494,13 +454,9 @@ class IterativeResolver:
 
             nameservers = next_nameservers
 
-        # Если ничего не вышло — возвращаем пустой NOERROR, чтобы сервер никогда не падал
         return 0, []
 
 
-# =====================================================================
-# 5. Обработка клиентских запросов по UDP и TCP (3 + 2 балла)
-# =====================================================================
 
 async def handle_dns_query(raw_data: bytes, resolver: IterativeResolver) -> bytes:
     """Формирует корректный ответ клиенту и гарантирует отсутствие падений."""
@@ -514,8 +470,6 @@ async def handle_dns_query(raw_data: bytes, resolver: IterativeResolver) -> byte
 
         rcode, answers = await resolver.resolve(q.qname, q.qtype)
 
-        # Формируем флаги ответа:
-        # QR = 1 (ответ), RD = копируем из запроса, RA = 1 (рекурсия доступна), RCODE = 0 или 3
         rd_bit = req.flags & 0x0100
         resp_flags = 0x8000 | rd_bit | 0x0080 | (rcode & 0x000F)
 
@@ -523,7 +477,6 @@ async def handle_dns_query(raw_data: bytes, resolver: IterativeResolver) -> byte
 
     except Exception as e:
         print(f"[ERROR] Ошибка обработки пакета: {e}")
-        # Даже при битом пакете стараемся вернуть NOERROR, если можем вытащить ID
         tx_id = struct.unpack("!H", raw_data[:2])[0] if len(raw_data) >= 2 else 0
         return build_packet(tx_id, 0x8180, [])
 
@@ -537,7 +490,6 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
-        # Запускаем обработку каждого клиента в отдельной корутине (одновременная работа!)
         asyncio.create_task(self._handle(data, addr))
 
     async def _handle(self, data: bytes, addr: Tuple[str, int]):
@@ -570,12 +522,10 @@ async def main(host: str = "127.0.0.1", port: int = 53):
     resolver = IterativeResolver(cache)
     loop = asyncio.get_running_loop()
 
-    # Запуск UDP-сервера
     udp_transport, _ = await loop.create_datagram_endpoint(
         lambda: UDPServerProtocol(resolver), local_addr=(host, port)
     )
 
-    # Запуск TCP-сервера
     tcp_server = await asyncio.start_server(
         lambda r, w: handle_tcp_client(r, w, resolver), host, port
     )
