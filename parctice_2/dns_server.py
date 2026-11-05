@@ -18,7 +18,7 @@ ROOT_SERVERS = [
 ]
 
 # Куда будет слкадываться кэш, чтобы не нагружать сервак
-CACHE_FILE = "dns_cache.pkl"
+CACHE_FILE = "dns_cache.json"
 
 # Константы
 TYPE_A = 1      # IPv4-адрес
@@ -261,40 +261,54 @@ class DNSCache:
         # Ищем ключ
         if key not in self.store:
             return None
-
         rcode, items = self.store[key]
+
+        # Берем время для проверки TTL
         now = time.time()
         valid_records = []
 
+        # Проверка всего на истёкшее TTL
         for rec, expire_at in items:
             remaining_ttl = int(expire_at - now)
+            # Если время вышло, запись удаляется из словаря
             if remaining_ttl <= 0:
                 del self.store[key]
                 return None
+            # Делаем свежий DNSRecord
             valid_records.append(
                 DNSRecord(rec.name, rec.rtype, rec.rclass, remaining_ttl, rec.rdata, rec.parsed_data)
             )
 
         return rcode, valid_records
 
+    # Метод записи в кеш
     def put(self, qname: str, qtype: int, rcode: int, records: List[DNSRecord], default_ttl: int = 60):
         now = time.time()
         items = []
         if records:
             for rec in records:
+                # Вычисляем момент времени в будущем, когда запись перестанет быть актуальной
                 ttl = rec.ttl if rec.ttl > 0 else default_ttl
                 items.append((rec, now + ttl))
         else:
+            # Для NXDOMAIN или пустого ответа сохраняем пустой список с коротким TTL
             items.append((DNSRecord(qname, qtype, CLASS_IN, default_ttl, b""), now + default_ttl))
 
         self.store[(qname.lower(), qtype)] = (rcode, items)
         self.save()
 
+    # Метод сохранения кэша на диск в .json файл
     def save(self):
         try:
             serializable = {}
             now = time.time()
+            # JSON не умеет сохранять кортежи как ключи
+            # и не понимает сырые байты (bytes).
+            # Ключ (qname, qtype) превращается в строку: f"{qname}|{qtype}"
+            # Сырые байты ответа r.rdata переводятся в шестнадцатеричную строку через hex()
+            # Сделал так вместо .pkl так как .pkl труднее прочитать в блокнотах
             for (qname, qtype), (rcode, items) in self.store.items():
+                # Перед сохранением отсеиваются уже протухшие записи, чтобы файл не разрастался мусором
                 if all(exp > now for _, exp in items):
                     serializable[f"{qname}|{qtype}"] = {
                         "rcode": rcode,
@@ -316,6 +330,7 @@ class DNSCache:
         except Exception as e:
             print(f"[WARN] Ошибка сохранения кеша: {e}")
 
+    # Метод восстановления памяти сервера при перезапуске
     def load(self):
         if not os.path.exists(self.filename):
             return
@@ -346,23 +361,28 @@ class DNSCache:
             print(f"[WARN] Не удалось загрузить кеш: {e}")
 
 
+# Метод специально для .multiply
 def check_multiply_rule(qname: str, qtype: int) -> Optional[List[DNSRecord]]:
     """
     Если в запросе встречается '.multiply.', возвращает IP 127.0.0.X,
     где X - произведение чисел до 'multiply' по модулю 256.
     Пример: 2.22.multiply.test.com -> 127.0.0.44
     """
+
+    # Ищем multiply
     clean_name = qname.strip(".").lower()
     labels = clean_name.split(".")
     if "multiply" not in labels:
         return None
 
     idx = labels.index("multiply")
+    # Берем срез всех элементов, стоящих строго до метки multiply
     prefix_labels = labels[:idx]
 
     if not prefix_labels:
         return None
 
+    # Умножение по модулю 256
     product = 1
     try:
         for lbl in prefix_labels:
@@ -370,21 +390,27 @@ def check_multiply_rule(qname: str, qtype: int) -> Optional[List[DNSRecord]]:
     except ValueError:
         return None
 
+    # Если запрос не в IPv4
     if qtype != TYPE_A:
         return []
 
+    # Формируем метод и отправляем дальше
     ip_str = f"127.0.0.{product}"
     rdata = socket.inet_pton(socket.AF_INET, ip_str)
     return [DNSRecord(clean_name, TYPE_A, CLASS_IN, 300, rdata, ip_str)]
 
-
 async def send_udp_query(server_ip: str, packet_bytes: bytes, timeout: float = 2.5) -> Optional[bytes]:
-    """Отправляет одиночный UDP-запрос к авторитетному серверу."""
+    """Отправляет одиночный UDP-запрос ассинхронно к авторитетному серверу."""
     loop = asyncio.get_running_loop()
+    # «Труба» для отправки пакета по протоколу UDP
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Делаем сокет неблокирующим, тогда можно будет обслуживать другие клиенты, а не зависать
     sock.setblocking(False)
     try:
+        # Отправляем собранные байты на IP-адрес чужого сервера на порт 53
         await loop.sock_sendto(sock, packet_bytes, (server_ip, 53))
+        # Ждем ответа максимум 2.5 секунды.
+        # Если ответа нет (пакет потерялся), возвращает None
         data = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout=timeout)
         return data
     except Exception:
@@ -392,7 +418,7 @@ async def send_udp_query(server_ip: str, packet_bytes: bytes, timeout: float = 2
     finally:
         sock.close()
 
-
+# Основной итеративный ресолвер для
 class IterativeResolver:
     def __init__(self, cache: DNSCache):
         self.cache = cache
@@ -404,14 +430,17 @@ class IterativeResolver:
         """
         qname = qname.strip(".").lower()
 
+        # Защита от бесконечного цикла
         if depth > 15:
             return 2, []
 
+        # Проверка на multiply
         mult_res = check_multiply_rule(qname, qtype)
         if mult_res is not None:
             print(f"[MULTIPLY] {qname} -> {mult_res[0].parsed_data if mult_res else 'EMPTY'}")
             return 0, mult_res
 
+        # Проверка в кэше
         cached = self.cache.get(qname, qtype)
         if cached is not None:
             rcode, records = cached
@@ -420,16 +449,21 @@ class IterativeResolver:
             print(f"[CACHE HIT] {qname} (type={qtype})")
             return rcode, records
 
+        # Начинаем с корневых серваков
+        # (берем рандомный, чтобы не бомбить один сервак)
         nameservers = list(ROOT_SERVERS)
         random.shuffle(nameservers)
 
+        # Максимум 20 шагов, чтобы дойти до нашего сервера
         for _step in range(20):
             if not nameservers:
                 break
 
+            # Генерируем id талона
             tx_id = random.randint(1, 65534)
             query_pkt = build_packet(tx_id, 0x0000, [DNSQuestion(qname, qtype, CLASS_IN)])
 
+            # Отправляем пакет
             response_pkt = None
             for ns_ip in nameservers:
                 raw_resp = await send_udp_query(ns_ip, query_pkt)
@@ -443,20 +477,27 @@ class IterativeResolver:
             if not response_pkt:
                 break
 
+            # Разбор ответа от сервера
+            # Сайта не существует (response_pkt.rcode == 3)
             if response_pkt.rcode == 3:
                 self.cache.put(qname, qtype, 3, [])
                 return 3, []
 
+            # Кэшируем всё, что получили
             for add_rec in response_pkt.additionals:
                 if add_rec.rtype == TYPE_A and add_rec.parsed_data:
                     self.cache.put(add_rec.name, TYPE_A, 0, [add_rec])
 
+            # Ответ есть
             if response_pkt.answers:
                 direct_answers = [r for r in response_pkt.answers if r.rtype == qtype]
                 if direct_answers:
                     self.cache.put(qname, qtype, 0, response_pkt.answers)
                     return 0, response_pkt.answers
 
+                #Если просили IP, а
+                # вернули запись типа CNAME,
+                # приходится вызывать resolve саму себя рекурсивно
                 cnames = [r for r in response_pkt.answers if r.rtype == TYPE_CNAME]
                 if cnames and qtype != TYPE_CNAME:
                     cname_rec = cnames[0]
@@ -470,14 +511,18 @@ class IterativeResolver:
                 self.cache.put(qname, qtype, 0, response_pkt.answers)
                 return 0, response_pkt.answers
 
+            # Записи такого типа нет
+            # (сам домен существует, но записей запрошенного типа)
             if any(r.rtype == TYPE_SOA for r in response_pkt.authorities):
                 self.cache.put(qname, qtype, 0, [])
                 return 0, []
 
+            # Ищем следующие серваки
             ns_records = [r for r in response_pkt.authorities if r.rtype == TYPE_NS and r.parsed_data]
             if not ns_records:
                 return 0, []
 
+            # Их IP могут быть в секции с additionals
             glue_ips = {}
             for add_rec in response_pkt.additionals:
                 if add_rec.rtype == TYPE_A and add_rec.parsed_data:
@@ -489,6 +534,8 @@ class IterativeResolver:
                 if ns_domain in glue_ips:
                     next_nameservers.append(glue_ips[ns_domain])
 
+            # Если нет айпишников,
+            # а только домены - бежим искать ip этих серваков
             if not next_nameservers:
                 for ns_rec in ns_records[:2]:
                     ns_domain = ns_rec.parsed_data.lower()
@@ -508,18 +555,23 @@ class IterativeResolver:
 async def handle_dns_query(raw_data: bytes, resolver: IterativeResolver) -> bytes:
     """Формирует корректный ответ клиенту и гарантирует отсутствие падений."""
     try:
+        # Формируем пакет
         req = parse_packet(raw_data)
+        # Защита на случай странных пакетов, в которых нет ни одного вопроса
         if not req.questions:
             return build_packet(req.tx_id, 0x8180, [])
 
         q = req.questions[0]
         print(f"[QUERY] {q.qname} (type={q.qtype})")
 
+        # Запускаем резолвер
         rcode, answers = await resolver.resolve(q.qname, q.qtype)
 
+        # Формируем биты заголовка ответа
         rd_bit = req.flags & 0x0100
         resp_flags = 0x8000 | rd_bit | 0x0080 | (rcode & 0x000F)
 
+        # Строим новый пакет
         return build_packet(req.tx_id, resp_flags, req.questions, answers=answers)
 
     except Exception as e:
@@ -527,7 +579,7 @@ async def handle_dns_query(raw_data: bytes, resolver: IterativeResolver) -> byte
         tx_id = struct.unpack("!H", raw_data[:2])[0] if len(raw_data) >= 2 else 0
         return build_packet(tx_id, 0x8180, [])
 
-
+# Класс сервера UDP
 class UDPServerProtocol(asyncio.DatagramProtocol):
     def __init__(self, resolver: IterativeResolver):
         self.resolver = resolver
@@ -537,6 +589,7 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        # Запускаем обработку каждого клиента асинхронно
         asyncio.create_task(self._handle(data, addr))
 
     async def _handle(self, data: bytes, addr: Tuple[str, int]):
@@ -546,11 +599,13 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
 
 
 async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, resolver: IterativeResolver):
-    """Обработчик TCP-соединений (в TCP перед пакетом идут 2 байта длины)."""
+    """Обработчик TCP-соединений (в TCP перед пакетом идут 2 байта длины в отличии от UDP)."""
     try:
         while True:
+            # Читаем ровно 2 первых байта
             length_bytes = await reader.readexactly(2)
             length = struct.unpack("!H", length_bytes)[0]
+            # Вычитываем ровно столько байт, сколько было заявлено
             data = await reader.readexactly(length)
             resp = await handle_dns_query(data, resolver)
             writer.write(struct.pack("!H", len(resp)) + resp)
@@ -567,12 +622,13 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
 async def main(host: str = "127.0.0.1", port: int = 53):
     cache = DNSCache()
     resolver = IterativeResolver(cache)
+    # Открываем UDP-сокет на 127.0.0.1:53
     loop = asyncio.get_running_loop()
-
     udp_transport, _ = await loop.create_datagram_endpoint(
         lambda: UDPServerProtocol(resolver), local_addr=(host, port)
     )
 
+    # Запускаем асинхронный TCP-сервер на том же адресе и порту
     tcp_server = await asyncio.start_server(
         lambda r, w: handle_tcp_client(r, w, resolver), host, port
     )
@@ -580,6 +636,7 @@ async def main(host: str = "127.0.0.1", port: int = 53):
     print(f"[START] DNS-сервер запущен на {host}:{port} (UDP и TCP). Нажми Ctrl+C для выхода.")
     try:
         async with tcp_server:
+            # Переводим цикл событий в режим бесконечного ожидания новых клиентов
             await tcp_server.serve_forever()
     finally:
         udp_transport.close()
@@ -590,6 +647,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main("127.0.0.1", 53))
     except PermissionError:
-        print("Ошибка прав доступа к порту 53! Запусти с sudo (Linux/macOS) или от имени Администратора (Windows).")
+        print("Ошибка прав доступа к порту 53.")
     except KeyboardInterrupt:
         print("\n[STOP] Сервер остановлен.")
