@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+# Главные dns-серваки инета
+# Обратиться можно к любому так как у нас единый каталог данных там
 ROOT_SERVERS = [
     "198.41.0.4",
     "170.247.170.2",
@@ -15,45 +17,49 @@ ROOT_SERVERS = [
     "199.7.91.13",
 ]
 
+# Куда будет слкадываться кэш, чтобы не нагружать сервак
 CACHE_FILE = "dns_cache.pkl"
 
-TYPE_A = 1
-TYPE_NS = 2
-TYPE_CNAME = 5
-TYPE_SOA = 6
-TYPE_MX = 15
-TYPE_TXT = 16
-TYPE_AAAA = 28
+# Константы
+TYPE_A = 1      # IPv4-адрес
+TYPE_AAAA = 28  # IPv6-адрес
+TYPE_NS = 2     # Имя ответственного DNS-сервера зоны
+TYPE_CNAME = 5  # Каноническое имя
+TYPE_SOA = 6    # Начало зоны полномочий
+TYPE_MX = 15    # Почтовый сервер
+TYPE_TXT = 16   # Текстовые записи
+CLASS_IN = 1    # Класс сети: Internet
 
-CLASS_IN = 1
-
-
+# Класс вопроса днс серваку
 @dataclass
 class DNSQuestion:
-    qname: str
-    qtype: int
-    qclass: int
+    qname: str  # Что ищем
+    qtype: int  # Тип домена, который запрашиваем
+    qclass: int # Класс сети
 
 
+# Класс ответа от днс-сервака
 @dataclass
 class DNSRecord:
-    name: str
-    rtype: int
-    rclass: int
-    ttl: int
-    rdata: bytes
-    parsed_data: Optional[str] = None
+    name: str                           # О каком доменном имени идёт речь
+    rtype: int                          # Тип записи, которая пришла
+    rclass: int                         # Класс сети записи
+    ttl: int                            # Сколько эта запись будет жить айпишник в памяти
+    rdata: bytes                        # Сам ответ в байтах
+    parsed_data: Optional[str] = None   # Ответ в нормальном виде для логов
 
 
+# Класс всего пакета для днс сервера
 @dataclass
 class DNSPacket:
-    tx_id: int
-    flags: int
-    questions: List[DNSQuestion]
-    answers: List[DNSRecord]
-    authorities: List[DNSRecord]
-    additionals: List[DNSRecord]
+    tx_id: int                      # ID запроса
+    flags: int                      # Флаги (является ли пакет ответом, запрошена ли рекурсия, доступна ли она на сервере и т.д.)
+    questions: List[DNSQuestion]    # Вопросы
+    answers: List[DNSRecord]        # Ответы
+    authorities: List[DNSRecord]    # Сервера, отвечающие за определенную зону
+    additionals: List[DNSRecord]    # Что-то дополнительное, я не помню
 
+    # Метод, который достаёт код ответа из флагов и переводит сразу в норм число
     @property
     def rcode(self) -> int:
         return self.flags & 0x000F
@@ -61,7 +67,7 @@ class DNSPacket:
 
 
 def encode_domain_name(domain: str) -> bytes:
-    """Кодирует доменное имя в формат DNS (3www7example3com0)."""
+    """Кодирует доменное имя в формат DNS (3www7example3com0)"""
     domain = domain.strip(".")
     if not domain:
         return b"\x00"
@@ -70,7 +76,7 @@ def encode_domain_name(domain: str) -> bytes:
 
 
 def decode_domain_name(data: bytes, offset: int) -> Tuple[str, int]:
-    """Декодирует доменное имя с учетом DNS pointer compression (0xC0)."""
+    """Декодирует доменное имя с учетом DNS pointer compression (0xC0)"""
     labels = []
     jumped = False
     original_offset = offset
@@ -80,31 +86,41 @@ def decode_domain_name(data: bytes, offset: int) -> Tuple[str, int]:
     while True:
         if offset >= len(data):
             break
+        # Читается первый байт доменного имени
         length = data[offset]
         if length == 0:
             offset += 1
             break
+        # Если первый байт - это ссылка (первый байт - 0xC0), то идем искать на что она указывает
         if (length & 0xC0) == 0xC0:
             if not jumped:
                 original_offset = offset + 2
                 jumped = True
+            # Считываем 2 байта указателя и маской 0x3FFF убираем первые две единицы от указателя-ссылки.
             pointer = struct.unpack("!H", data[offset : offset + 2])[0] & 0x3FFF
             offset = pointer
             jumps += 1
+            # Защита от зацикливания, если вредоносный или поврежденный пакет заставит функцию прыгать по кругу
             if jumps > max_jumps:
                 raise ValueError("Слишком много переходов сжатия в DNS-пакете")
         else:
             offset += 1
+            # Декодируем часть домена
             labels.append(data[offset : offset + length].decode("ascii", errors="ignore"))
             offset += length
 
+    # Собираем домен
     domain = ".".join(labels).lower()
+    # Отдаем домен и еще смещение в пакете, чтобы дальше с него идти
     return domain, (original_offset if jumped else offset)
 
 
 def parse_record(data: bytes, offset: int) -> Tuple[DNSRecord, int]:
-    """Парсит одну Resource Record (RR) и распаковывает сжатые имена внутри RDATA."""
+    """Парсит одну Resource Record и распаковывает сжатые имена внутри RDATA."""
+
+    # Сначала читается имя, к которому относится запись
     name, offset = decode_domain_name(data, offset)
+    # Далее разбираем следующие 10 байт заголовка записи
     rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", data[offset : offset + 10])
     offset += 10
     rdata_start = offset
@@ -114,23 +130,39 @@ def parse_record(data: bytes, offset: int) -> Tuple[DNSRecord, int]:
     parsed_data = None
     uncompressed_rdata = raw_rdata
 
+    # Далее работаем в зависимости от типа записи
     if rtype == TYPE_A and rdlength == 4:
+        # Для IPv4 (TYPE_A) 4 сырых байта преобразуются в IP
         parsed_data = socket.inet_ntop(socket.AF_INET, raw_rdata)
     elif rtype == TYPE_AAAA and rdlength == 16:
+        # Для IPv6 (TYPE_AAAA) 16 сырых байт преобразуются в IP
         parsed_data = socket.inet_ntop(socket.AF_INET6, raw_rdata)
     elif rtype in (TYPE_NS, TYPE_CNAME):
+        # Для NS (имя DNS-сервера) или CNAME (каноническое имя)
+        # мы на всякий случай декодируем внутренний адрес (так как там может быть днс сжатие)
+        # и обратно кодируем
         target_domain, _ = decode_domain_name(data, rdata_start)
         parsed_data = target_domain
         uncompressed_rdata = encode_domain_name(target_domain)
     elif rtype == TYPE_MX:
+        # Для MX (почтового сервера) сначала идут 2 байта приоритета (preference),
+        # а затем — доменное имя почтового сервера (exchange)
         preference = struct.unpack("!H", raw_rdata[:2])[0]
         exchange, _ = decode_domain_name(data, rdata_start + 2)
+        # Читабельная версия - в строку
         parsed_data = f"{preference} {exchange}"
+        # Для безопасного сохранения в кеш склеиваем то что брали
         uncompressed_rdata = struct.pack("!H", preference) + encode_domain_name(exchange)
     elif rtype == TYPE_SOA:
+        # Запись SOA возвращается, когда мы дошли до авторитетного сервера, но нужной записи нет
+        # Внутри SOA лежат сразу два доменных имени подряд:
+        # mname — главный сервер зоны;
+        # rname — почта администратора зоны (где @ заменена точкой)
+        # И еще хвост с 4 байтами чисел
         mname, next_off = decode_domain_name(data, rdata_start)
         rname, next_off = decode_domain_name(data, next_off)
         tail = data[next_off : rdata_start + rdlength]
+        # Для безопасного сохранения в кеш склеиваем то что получили
         uncompressed_rdata = encode_domain_name(mname) + encode_domain_name(rname) + tail
 
     return DNSRecord(name, rtype, rclass, ttl, uncompressed_rdata, parsed_data), offset
@@ -138,9 +170,12 @@ def parse_record(data: bytes, offset: int) -> Tuple[DNSRecord, int]:
 
 def parse_packet(data: bytes) -> DNSPacket:
     """Полный разбор сырого DNS-пакета."""
+
+    # Чиитаем ровно первые 12 байт пакета (заголовок) как 6 двухбайтовых чисел (6H)
     tx_id, flags, qdcount, ancount, nscount, arcount = struct.unpack("!6H", data[:12])
     offset = 12
 
+    # Получаем вопросы
     questions = []
     for _ in range(qdcount):
         qname, offset = decode_domain_name(data, offset)
@@ -149,12 +184,15 @@ def parse_packet(data: bytes) -> DNSPacket:
         questions.append(DNSQuestion(qname, qtype, qclass))
 
     answers, authorities, additionals = [], [], []
+    # Получаем ответы
     for _ in range(ancount):
         rec, offset = parse_record(data, offset)
         answers.append(rec)
+    # Получаем NS записи
     for _ in range(nscount):
         rec, offset = parse_record(data, offset)
         authorities.append(rec)
+    # Получаем Additional записи
     for _ in range(arcount):
         rec, offset = parse_record(data, offset)
         additionals.append(rec)
@@ -175,6 +213,7 @@ def build_packet(
     authorities = authorities or []
     additionals = additionals or []
 
+    # Делаем заголовок
     header = struct.pack(
         "!6H",
         tx_id,
@@ -186,10 +225,12 @@ def build_packet(
     )
 
     body = bytearray()
+    # Делаем вопросы
     for q in questions:
         body.extend(encode_domain_name(q.qname))
         body.extend(struct.pack("!HH", q.qtype, q.qclass))
 
+    # Делаем ответы
     for section in (answers, authorities, additionals):
         for rec in section:
             if rec.rtype == 41:
@@ -203,15 +244,21 @@ def build_packet(
     return header + bytes(body)
 
 
-
+# Класс для кэширования (учет TTL и сохранение на диск при перезапуске)
 class DNSCache:
     def __init__(self, filename: str = CACHE_FILE):
+        # Имя файла на диске
         self.filename = filename
+        # Основной словарь в оперативной памяти:
+        # Ключ словаря: кортеж (qname, qtype)
+        # Значение словаря: кортеж (rcode, список пар (запись DNSRecord, TTL))
         self.store: Dict[Tuple[str, int], Tuple[int, List[Tuple[DNSRecord, float]]]] = {}
         self.load()
 
+    # Метод поиска записи в кэше
     def get(self, qname: str, qtype: int) -> Optional[Tuple[int, List[DNSRecord]]]:
         key = (qname.lower(), qtype)
+        # Ищем ключ
         if key not in self.store:
             return None
 
