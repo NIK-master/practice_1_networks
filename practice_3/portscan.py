@@ -11,7 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 # Глушим лишние предупреждения scapy, чтобы не получить штраф -2 за мусор в выводе
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
-from scapy.all import ICMP, IP, TCP, UDP, conf, send, sr1  # noqa: E402
+from scapy.config import conf  # noqa: E402
+from scapy.layers.inet import ICMP, IP, TCP, UDP  # noqa: E402
+from scapy.sendrecv import send, sr1  # noqa: E402
 
 conf.verb = 0  # Запрещаем scapy печатать служебные сообщения (типа "Sent 1 packets")
 
