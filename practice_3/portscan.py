@@ -17,13 +17,10 @@ from scapy.sendrecv import send, sr1  # noqa: E402
 
 conf.verb = 0  # Запрещаем scapy печатать служебные сообщения (типа "Sent 1 packets")
 
-# Блокировка, чтобы потоки не перемешивали текст при одновременном print()
+# Лок потоков, чтобы не перемешивали текст при одновременном print
 print_lock = threading.Lock()
 
 
-# ==========================================
-# 1. РАЗБОР АРГУМЕНТОВ И ПОРТОВ
-# ==========================================
 
 def parse_targets(target_args: list[str]) -> list[tuple[str, int]]:
     """
@@ -40,7 +37,7 @@ def parse_targets(target_args: list[str]) -> list[tuple[str, int]]:
         if proto not in ("TCP", "UDP"):
             raise ValueError(f"Неизвестный протокол: {proto}")
 
-        # Если порты не указаны (просто 'tcp' или 'udp') — берём все порты
+        # Если порты не указаны - берём все порты
         if len(parts) == 1 or not parts[1]:
             ports = range(1, 65536)
         else:
@@ -67,17 +64,14 @@ def parse_targets(target_args: list[str]) -> list[tuple[str, int]]:
     return tasks
 
 
-# ==========================================
-# 2. СКАНИРОВАНИЕ ПОРТОВ (TCP SYN и UDP)
-# ==========================================
-
 def scan_tcp_syn(ip: str, port: int, timeout: float) -> tuple[bool, float | None]:
     """
     Отправляет TCP SYN через scapy.
-    Если пришёл SYN-ACK — порт открыт, сразу шлём RST (чтобы закрыть полуоткрытое соединение).
+    Если пришёл SYN-ACK - порт открыт, сразу шлём RST.
     Возвращает: (открыт_ли_порт, время_ответа_в_мс).
     """
     src_port = random.randint(1024, 65535)
+    # Флаг "S" - это SYN
     syn_pkt = IP(dst=ip) / TCP(sport=src_port, dport=port, flags="S")
 
     start_time = time.perf_counter()
@@ -89,9 +83,8 @@ def scan_tcp_syn(ip: str, port: int, timeout: float) -> tuple[bool, float | None
 
     if resp.haslayer(TCP):
         flags = resp[TCP].flags
-        # 0x12 означает SYN + ACK ("SA") — порт открыт!
         if flags == 0x12:
-            # ОБЯЗАТЕЛЬНО шлём RST, чтобы не получить штраф -2 за полуоткрытое соединение
+            # Шлем RST, чтобы не оставлять полуоткрытое соединение
             rst_pkt = IP(dst=ip) / TCP(
                 sport=src_port,
                 dport=port,
@@ -129,9 +122,7 @@ def scan_udp(ip: str, port: int, timeout: float) -> bool:
     return False
 
 
-# ==========================================
-# 3. ОПРЕДЕЛЕНИЕ ПРОТОКОЛА (-g / --guess)
-# ==========================================
+# GUESS
 
 # Готовый минимальный DNS-запрос для домена "example.com" с ID = 0xAABB
 DNS_QUERY = (
@@ -145,6 +136,7 @@ DNS_QUERY = (
 )
 
 
+# Проверка на http
 def is_http(ip: str, port: int, timeout: float) -> bool:
     try:
         with socket.create_connection((ip, port), timeout=timeout) as sock:
@@ -157,6 +149,7 @@ def is_http(ip: str, port: int, timeout: float) -> bool:
         return False
 
 
+# Проверка на dns
 def is_dns(ip: str, port: int, proto: str, timeout: float) -> bool:
     try:
         if proto == "UDP":
@@ -175,12 +168,14 @@ def is_dns(ip: str, port: int, proto: str, timeout: float) -> bool:
                 resp_len = struct.unpack("!H", raw_len)[0]
                 data = sock.recv(resp_len)
 
-        # Проверяем: совпал ли ID (0xAABB) и выставлен ли бит "это ответ" (0x80)
+        # Проверяем: совпал ли ID
+        # и выставлен ли бит "это ответ" (0x80)
         return len(data) >= 12 and data[:2] == b"\xaa\xbb" and (data[2] & 0x80) != 0
     except OSError:
         return False
 
 
+# Проверка на echo
 def is_echo(ip: str, port: int, proto: str, timeout: float) -> bool:
     payload = b"portscan_echo_probe_12345\r\n"
     try:
@@ -216,10 +211,7 @@ def guess_protocol(ip: str, port: int, proto: str, timeout: float) -> str:
     return "-"
 
 
-# ==========================================
-# 4. РАБОТА ОДНОГО ПОТОКА И ЗАПУСК
-# ==========================================
-
+# Поток
 def worker(ip: str, proto: str, port: int, timeout: float, verbose: bool, guess: bool) -> None:
     if proto == "TCP":
         is_open, rtt_ms = scan_tcp_syn(ip, port, timeout)
@@ -230,7 +222,7 @@ def worker(ip: str, proto: str, port: int, timeout: float, verbose: bool, guess:
     if not is_open:
         return
 
-    # Собираем строку вывода строго по формату: TCP|UDP PORT [TIME,ms] [PROTOCOL|-]
+    # Собираем строку вывода строго по формату: "[TCP|UDP] [PORT] [TIME] [PROTOCOL|-]"
     output_parts = [proto, str(port)]
 
     if verbose:
@@ -259,15 +251,17 @@ def main() -> None:
     parser.add_argument("ip", metavar="IP_ADDRESS", help="Целевой IP-адрес")
     parser.add_argument("targets", nargs="+", help="Спецификация портов (например, tcp/80,443 udp/53)")
 
-    # parse_intermixed_args позволяет писать флаги в любом месте (и до IP, и после)
+    # parse_intermixed_args позволяет перемешивать флаги
     args = parser.parse_intermixed_args()
 
+    # Разбиваем порты на соответствия (протокол - порт)
     try:
         tasks = parse_targets(args.targets)
     except ValueError as err:
         print(f"Ошибка в аргументах: {err}", file=sys.stderr)
         sys.exit(1)
 
+    # Делаем пул потоков
     with ThreadPoolExecutor(max_workers=args.num_threads) as executor:
         for proto, port in tasks:
             executor.submit(
